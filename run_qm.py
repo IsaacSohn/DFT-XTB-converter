@@ -94,26 +94,129 @@ def format_extxyz(atoms: Atoms, energy: float, forces: List[Tuple[float,float,fl
     header_parts.append("Properties=species:S:1:pos:R:3:force:R:3:Z:I:1")
 
     out = [str(n), " ".join(header_parts)]
-    for sym, (x,y,z), (fx,fy,fz) in zip(symbols, pos, forces):
-        Z = int(atoms[ symbols.index(sym) ].number) if False else infer_Z(sym)  # stable formatting
-        out.append(f"{sym:<2s}  {x: .8f}  {y: .8f}  {z: .8f}  {fx: .8f}  {fy: .8f}  {fz: .8f}  {Z:d}")
+    numbers = atoms.get_atomic_numbers()
+    for sym, (x,y,z), (fx,fy,fz), Z in zip(symbols, pos, forces, numbers):
+        out.append(f"{sym:<2s}  {x: .8f}  {y: .8f}  {z: .8f}  {fx: .8f}  {fy: .8f}  {fz: .8f}  {int(Z):d}")
     return "\n".join(out) + "\n"
 
 # ---------- calculators ----------
 def run_xtb(atoms: Atoms, charge: int, uhf: int, optimize: bool) -> Tuple[float, List[Tuple[float,float,float]]]:
-    from ase.calculators.xtb import XTB
-    from ase.optimize import BFGS
+    """
+    xTB runner that works even when ase.calculators.xtb is missing.
 
-    calc = XTB(method="GFN2-xTB", charge=charge, uhf=uhf)
-    atoms.calc = calc
+    Strategy:
+      1) Try ASE's native XTB calculator if available.
+      2) Otherwise fall back to an external subprocess wrapper (Windows-safe encoding).
+    """
+    from ase.optimize import BFGS
+    import os
+    import subprocess
+    import tempfile
+    import numpy as np
+    from ase.calculators.calculator import Calculator, all_changes
+
+    # --- Try native ASE calculator first (if your ASE ever gains it later) ---
+    try:
+        from ase.calculators.xtb import XTB  # type: ignore
+        atoms.calc = XTB(method="GFN2-xTB", charge=charge, uhf=uhf)
+        if optimize:
+            BFGS(atoms, logfile=None).run(fmax=0.05)
+        e = float(atoms.get_potential_energy())
+        forces = [tuple(map(float, row)) for row in atoms.get_forces()]
+        return e, forces
+    except ModuleNotFoundError:
+        pass
+
+    # --- Fallback: external xtb.exe wrapper ---
+    class XTBExternal(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def __init__(self, xtb_command="xtb", charge=0, uhf=0, gfn=2, **kwargs):
+            super().__init__(**kwargs)
+            self.xtb_command = xtb_command
+            self.charge = int(charge)
+            self.uhf = int(uhf)
+            self.gfn = int(gfn)
+
+        def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+
+            with tempfile.TemporaryDirectory() as d:
+                xyz_path = os.path.join(d, "input.xyz")
+                atoms.write(xyz_path)
+
+                cmd = [
+                    self.xtb_command,
+                    xyz_path,
+                    f"--gfn{self.gfn}",
+                    "--chrg", str(self.charge),
+                    "--uhf", str(self.uhf),
+                    "--grad",
+                ]
+
+                p = subprocess.run(
+                    cmd,
+                    cwd=d,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                out = p.stdout
+                if p.returncode != 0:
+                    raise RuntimeError(f"xTB failed (code {p.returncode}). Output:\n{out}")
+
+                # Parse TOTAL ENERGY (Eh)
+                energy_eh = None
+                for line in out.splitlines():
+                    if "TOTAL ENERGY" in line and "Eh" in line:
+                        toks = line.replace("=", " ").split()
+                        for i, t in enumerate(toks):
+                            if t == "Eh" and i > 0:
+                                try:
+                                    energy_eh = float(toks[i - 1])
+                                except ValueError:
+                                    pass
+                if energy_eh is None:
+                    raise RuntimeError("Could not parse TOTAL ENERGY from xTB output.")
+
+                # Parse gradient file (Eh/Bohr)
+                grad_path = os.path.join(d, "gradient")
+                if not os.path.exists(grad_path):
+                    raise RuntimeError("xTB did not produce 'gradient' file (expected with --grad).")
+
+                floats = []
+                with open(grad_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        for tok in line.split():
+                            try:
+                                floats.append(float(tok))
+                            except ValueError:
+                                continue
+
+                n = len(atoms)
+                if len(floats) < 3 * n:
+                    raise RuntimeError("Could not parse enough gradient floats from gradient file.")
+
+                grad = np.array(floats[-3 * n :], dtype=float).reshape((n, 3))
+
+                # Units: Eh -> eV, Eh/Bohr -> eV/Å
+                EH_TO_EV = 27.211386245988
+                BOHR_TO_ANG = 0.529177210903
+                energy_ev = energy_eh * EH_TO_EV
+                forces_ev_per_ang = -(grad * EH_TO_EV / BOHR_TO_ANG)
+
+                self.results["energy"] = float(energy_ev)
+                self.results["forces"] = forces_ev_per_ang
+
+    atoms.calc = XTBExternal(charge=charge, uhf=uhf, gfn=2)
 
     if optimize:
-        dyn = BFGS(atoms, logfile=None)
-        dyn.run(fmax=0.05)
+        BFGS(atoms, logfile=None).run(fmax=0.05)
 
     e = float(atoms.get_potential_energy())
-    f = atoms.get_forces()
-    forces = [tuple(map(float, row)) for row in f]
+    forces = [tuple(map(float, row)) for row in atoms.get_forces()]
     return e, forces
 
 def run_qe(atoms: Atoms,
