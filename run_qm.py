@@ -10,8 +10,11 @@ Examples:
 # xTB singlepoint:
 python run_qm.py -i mols.xyz -o mols_xtb.extxyz --method xtb --charge 0 --uhf 0
 
-# xTB geometry-optimized? (optional): you can add --optimize
+# xTB geometry optimization (optional):
 python run_qm.py -i mols.xyz -o mols_xtb_opt.extxyz --method xtb --optimize
+
+# xTB periodic singlepoint (defaults to GFN1 for periodic):
+python run_qm.py -i cell.extxyz -o cell_xtb.extxyz --method xtb --xtb-iterations 1000 --xtb-etemp 1000
 
 # QE singlepoint (DFT) example:
 python run_qm.py -i cell.extxyz -o cell_dft.extxyz --method qe \
@@ -21,18 +24,23 @@ python run_qm.py -i cell.extxyz -o cell_dft.extxyz --method qe \
   --qe-ecutwfc 50 --qe-ecutrho 400
 
 Notes:
-- QE needs periodic cell info for solids; for isolated molecules, set large cell + pbc="F F F" or do gamma-only with big vacuum.
+- QE needs periodic cell info for solids.
+- The xTB fallback wrapper supports:
+    * nonperiodic systems via temporary XYZ
+    * periodic systems via temporary Turbomole-style coord file with $periodic/$lattice
+- For periodic systems, this script defaults to GFN1-xTB because GFN2-xTB under PBC
+  can fail with "Multipoles not available with PBC".
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from typing import Dict, List, Tuple, Optional
 
 from ase.io import iread
 from ase import Atoms
+
 
 # ---------- utilities ----------
 Z_MAP: Dict[str, int] = {
@@ -44,6 +52,8 @@ Z_MAP: Dict[str, int] = {
     "K": 19, "Ca": 20,
     "Fe": 26, "Co": 27, "Ni": 28, "Cu": 29, "Zn": 30,
 }
+
+
 def infer_Z(symbol: str) -> int:
     sym = symbol.strip()
     if len(sym) >= 2 and sym[1].islower():
@@ -51,9 +61,9 @@ def infer_Z(symbol: str) -> int:
     else:
         sym = sym[0].upper() + (sym[1:].lower() if len(sym) > 1 else "")
     if sym not in Z_MAP:
-        # fallback: ASE knows numbers, so we only need this for formatting
         raise ValueError(f"Unknown element '{symbol}' for Z. Add it to Z_MAP in run_qm.py.")
     return Z_MAP[sym]
+
 
 def cell_to_lattice_string(atoms: Atoms) -> Optional[str]:
     try:
@@ -63,12 +73,64 @@ def cell_to_lattice_string(atoms: Atoms) -> Optional[str]:
         a = cell.array
         if a.shape != (3, 3):
             return None
-        # consider "valid" if any cell vector is nonzero
         if float(abs(a).sum()) == 0.0:
             return None
-        return " ".join(f"{a[i,j]:.8f}" for i in range(3) for j in range(3))
+        return " ".join(f"{a[i, j]:.8f}" for i in range(3) for j in range(3))
     except Exception:
         return None
+
+
+def xtb_periodic_dim(atoms: Atoms) -> int:
+    try:
+        pbc = list(bool(x) for x in atoms.get_pbc())
+        return sum(pbc)
+    except Exception:
+        return 0
+
+
+def write_xtb_coord(path: str, atoms: Atoms) -> None:
+    """
+    Write Turbomole-style coord file for xTB.
+    Uses Angstrom for both coordinates and lattice.
+
+    Nonperiodic:
+      $coord angs
+      ...
+      $end
+
+    Periodic:
+      $coord angs
+      ...
+      $periodic N
+      $lattice angs
+      ...
+      $end
+    """
+    symbols = atoms.get_chemical_symbols()
+    positions = atoms.get_positions()
+    cell = atoms.get_cell().array
+    npbc = xtb_periodic_dim(atoms)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("$coord angs\n")
+        for sym, (x, y, z) in zip(symbols, positions):
+            f.write(f"  {x: .12f}  {y: .12f}  {z: .12f}  {sym.lower()}\n")
+
+        if npbc > 0:
+            f.write(f"$periodic {npbc}\n")
+            f.write("$lattice angs\n")
+
+            if npbc == 3:
+                for i in range(3):
+                    f.write(f"  {cell[i,0]: .12f}  {cell[i,1]: .12f}  {cell[i,2]: .12f}\n")
+            elif npbc == 2:
+                for i in range(2):
+                    f.write(f"  {cell[i,0]: .12f}  {cell[i,1]: .12f}  {cell[i,2]: .12f}\n")
+            elif npbc == 1:
+                f.write(f"  {cell[0,0]: .12f}  {cell[0,1]: .12f}  {cell[0,2]: .12f}\n")
+
+        f.write("$end\n")
+
 
 def pbc_string(atoms: Atoms) -> str:
     try:
@@ -76,37 +138,75 @@ def pbc_string(atoms: Atoms) -> str:
     except Exception:
         return "F F F"
 
-def format_extxyz(atoms: Atoms, energy: float, forces: List[Tuple[float,float,float]], method: str) -> str:
+
+def format_extxyz(
+    atoms: Atoms,
+    energy: float,
+    forces: List[Tuple[float, float, float]],
+    method: str,
+) -> str:
     symbols = atoms.get_chemical_symbols()
     pos = atoms.get_positions()
     n = len(symbols)
     lattice = cell_to_lattice_string(atoms)
     pbc = pbc_string(atoms)
 
-    header_parts = []
-    header_parts.append(f"TotEnergy={energy:.8f}")
-    header_parts.append("cutoff=-1.00000000")
-    header_parts.append("nneightol=1.20000000")
-    header_parts.append(f'method="{method}"')
-    header_parts.append(f'pbc="{pbc}"')
+    header_parts = [
+        f"TotEnergy={energy:.8f}",
+        "cutoff=-1.00000000",
+        "nneightol=1.20000000",
+        f'method="{method}"',
+        f'pbc="{pbc}"',
+    ]
     if lattice:
         header_parts.append(f'Lattice="{lattice}"')
     header_parts.append("Properties=species:S:1:pos:R:3:force:R:3:Z:I:1")
 
     out = [str(n), " ".join(header_parts)]
     numbers = atoms.get_atomic_numbers()
-    for sym, (x,y,z), (fx,fy,fz), Z in zip(symbols, pos, forces, numbers):
-        out.append(f"{sym:<2s}  {x: .8f}  {y: .8f}  {z: .8f}  {fx: .8f}  {fy: .8f}  {fz: .8f}  {int(Z):d}")
+    for sym, (x, y, z), (fx, fy, fz), Z in zip(symbols, pos, forces, numbers):
+        out.append(
+            f"{sym:<2s}  {x: .8f}  {y: .8f}  {z: .8f}  "
+            f"{fx: .8f}  {fy: .8f}  {fz: .8f}  {int(Z):d}"
+        )
     return "\n".join(out) + "\n"
 
+
 # ---------- calculators ----------
-def run_xtb(atoms: Atoms, charge: int, uhf: int, optimize: bool) -> Tuple[float, List[Tuple[float,float,float]]]:
+def run_xtb(
+    atoms: Atoms,
+    charge: int,
+    uhf: int,
+    optimize: bool,
+    gfn: Optional[int] = None,
+    iterations: Optional[int] = None,
+    etemp: Optional[float] = None,
+) -> Tuple[float, List[Tuple[float, float, float]]]:
     """
     xTB runner that works even when ase.calculators.xtb is missing.
 
-    Strategy:
-      1) Try ASE's native XTB calculator if available.
-      2) Otherwise fall back to an external subprocess wrapper (Windows-safe encoding).
+    Behavior:
+      - nonperiodic systems default to GFN2-xTB
+      - periodic systems default to GFN1-xTB
+      - periodic fallback path writes a Turbomole-style coord file
+      - nonperiodic fallback path writes plain XYZ
+
+    Parameters
+    ----------
+    charge : int
+        Total charge.
+    uhf : int
+        Number of unpaired electrons.
+    optimize : bool
+        Run BFGS optimization if True.
+    gfn : Optional[int]
+        Which GFN level to use. If None:
+          - periodic -> 1
+          - nonperiodic -> 2
+    iterations : Optional[int]
+        Max SCC iterations passed to xTB.
+    etemp : Optional[float]
+        Electronic temperature in K passed to xTB.
     """
     from ase.optimize import BFGS
     import os
@@ -115,44 +215,75 @@ def run_xtb(atoms: Atoms, charge: int, uhf: int, optimize: bool) -> Tuple[float,
     import numpy as np
     from ase.calculators.calculator import Calculator, all_changes
 
-    # --- Try native ASE calculator first (if your ASE ever gains it later) ---
+    if gfn is None:
+        gfn = 1 if atoms.get_pbc().any() else 2
+
+    # --- Try native ASE xTB calculator first if available ---
     try:
         from ase.calculators.xtb import XTB  # type: ignore
-        atoms.calc = XTB(method="GFN2-xTB", charge=charge, uhf=uhf)
+
+        atoms.calc = XTB(method=f"GFN{gfn}-xTB", charge=charge, uhf=uhf)
         if optimize:
             BFGS(atoms, logfile=None).run(fmax=0.05)
-        e = float(atoms.get_potential_energy())
+
+        energy = float(atoms.get_potential_energy())
         forces = [tuple(map(float, row)) for row in atoms.get_forces()]
-        return e, forces
+        return energy, forces
+
     except ModuleNotFoundError:
         pass
 
-    # --- Fallback: external xtb.exe wrapper ---
+    # --- External xTB wrapper ---
     class XTBExternal(Calculator):
         implemented_properties = ["energy", "forces"]
 
-        def __init__(self, xtb_command="xtb", charge=0, uhf=0, gfn=2, **kwargs):
+        def __init__(
+            self,
+            xtb_command: str = "xtb",
+            charge: int = 0,
+            uhf: int = 0,
+            gfn: int = 2,
+            iterations: Optional[int] = None,
+            etemp: Optional[float] = None,
+            **kwargs,
+        ):
             super().__init__(**kwargs)
             self.xtb_command = xtb_command
             self.charge = int(charge)
             self.uhf = int(uhf)
             self.gfn = int(gfn)
+            self.iterations = iterations
+            self.etemp = etemp
 
         def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
             super().calculate(atoms, properties, system_changes)
 
             with tempfile.TemporaryDirectory() as d:
-                xyz_path = os.path.join(d, "input.xyz")
-                atoms.write(xyz_path)
+                is_periodic = bool(atoms.get_pbc().any())
+
+                if is_periodic:
+                    if cell_to_lattice_string(atoms) is None:
+                        raise ValueError("Periodic input has PBC=True but no valid lattice/cell.")
+                    geom_path = os.path.join(d, "input.coord")
+                    write_xtb_coord(geom_path, atoms)
+                else:
+                    geom_path = os.path.join(d, "input.xyz")
+                    atoms.write(geom_path)
 
                 cmd = [
                     self.xtb_command,
-                    xyz_path,
+                    geom_path,
                     f"--gfn{self.gfn}",
                     "--chrg", str(self.charge),
                     "--uhf", str(self.uhf),
                     "--grad",
                 ]
+
+                if self.iterations is not None:
+                    cmd.extend(["--iterations", str(self.iterations)])
+
+                if self.etemp is not None:
+                    cmd.extend(["--etemp", str(self.etemp)])
 
                 p = subprocess.run(
                     cmd,
@@ -164,24 +295,24 @@ def run_xtb(atoms: Atoms, charge: int, uhf: int, optimize: bool) -> Tuple[float,
                     errors="replace",
                 )
                 out = p.stdout
+
                 if p.returncode != 0:
                     raise RuntimeError(f"xTB failed (code {p.returncode}). Output:\n{out}")
 
-                # Parse TOTAL ENERGY (Eh)
                 energy_eh = None
                 for line in out.splitlines():
                     if "TOTAL ENERGY" in line and "Eh" in line:
                         toks = line.replace("=", " ").split()
-                        for i, t in enumerate(toks):
-                            if t == "Eh" and i > 0:
+                        for i, tok in enumerate(toks):
+                            if tok == "Eh" and i > 0:
                                 try:
                                     energy_eh = float(toks[i - 1])
                                 except ValueError:
                                     pass
+
                 if energy_eh is None:
                     raise RuntimeError("Could not parse TOTAL ENERGY from xTB output.")
 
-                # Parse gradient file (Eh/Bohr)
                 grad_path = os.path.join(d, "gradient")
                 if not os.path.exists(grad_path):
                     raise RuntimeError("xTB did not produce 'gradient' file (expected with --grad).")
@@ -199,40 +330,51 @@ def run_xtb(atoms: Atoms, charge: int, uhf: int, optimize: bool) -> Tuple[float,
                 if len(floats) < 3 * n:
                     raise RuntimeError("Could not parse enough gradient floats from gradient file.")
 
-                grad = np.array(floats[-3 * n :], dtype=float).reshape((n, 3))
+                grad = np.array(floats[-3 * n:], dtype=float).reshape((n, 3))
 
-                # Units: Eh -> eV, Eh/Bohr -> eV/Å
+                # Units:
+                # energy in Eh -> eV
+                # gradient in Eh/Bohr -> force in eV/Ang, with minus sign
                 EH_TO_EV = 27.211386245988
                 BOHR_TO_ANG = 0.529177210903
+
                 energy_ev = energy_eh * EH_TO_EV
                 forces_ev_per_ang = -(grad * EH_TO_EV / BOHR_TO_ANG)
 
                 self.results["energy"] = float(energy_ev)
                 self.results["forces"] = forces_ev_per_ang
 
-    atoms.calc = XTBExternal(charge=charge, uhf=uhf, gfn=2)
+    atoms.calc = XTBExternal(
+        charge=charge,
+        uhf=uhf,
+        gfn=gfn,
+        iterations=iterations,
+        etemp=etemp,
+    )
 
     if optimize:
         BFGS(atoms, logfile=None).run(fmax=0.05)
 
-    e = float(atoms.get_potential_energy())
+    energy = float(atoms.get_potential_energy())
     forces = [tuple(map(float, row)) for row in atoms.get_forces()]
-    return e, forces
+    return energy, forces
 
-def run_qe(atoms: Atoms,
-           pseudo_dir: str,
-           pseudo_map: Dict[str, str],
-           kpts: Tuple[int,int,int],
-           ecutwfc: float,
-           ecutrho: float,
-           optimize: bool) -> Tuple[float, List[Tuple[float,float,float]]]:
+
+def run_qe(
+    atoms: Atoms,
+    pseudo_dir: str,
+    pseudo_map: Dict[str, str],
+    kpts: Tuple[int, int, int],
+    ecutwfc: float,
+    ecutrho: float,
+    optimize: bool,
+) -> Tuple[float, List[Tuple[float, float, float]]]:
     """
     QE via ASE. Requires Quantum ESPRESSO installed (pw.x).
     """
     from ase.calculators.espresso import Espresso, EspressoProfile
     from ase.optimize import BFGS
 
-    # Build input_data
     input_data = {
         "control": {
             "calculation": "scf",
@@ -243,16 +385,14 @@ def run_qe(atoms: Atoms,
         "system": {
             "ecutwfc": float(ecutwfc),
             "ecutrho": float(ecutrho),
-            # smearing settings can be added for metals
         },
         "electrons": {
             "conv_thr": 1.0e-8,
         },
     }
 
-    # If optimization, switch calculation and let ASE optimize positions
     if optimize:
-        input_data["control"]["calculation"] = "scf"  # ASE optimizer calls forces each step
+        input_data["control"]["calculation"] = "scf"
 
     pseudopotentials = {el: pseudo_map[el] for el in set(atoms.get_chemical_symbols())}
 
@@ -262,7 +402,7 @@ def run_qe(atoms: Atoms,
         pseudopotentials=pseudopotentials,
         pseudo_dir=pseudo_dir,
         input_data=input_data,
-        kpts=kpts
+        kpts=kpts,
     )
     atoms.calc = calc
 
@@ -270,17 +410,18 @@ def run_qe(atoms: Atoms,
         dyn = BFGS(atoms, logfile=None)
         dyn.run(fmax=0.05)
 
-    e = float(atoms.get_potential_energy())
-    f = atoms.get_forces()
-    forces = [tuple(map(float, row)) for row in f]
-    return e, forces
+    energy = float(atoms.get_potential_energy())
+    forces = [tuple(map(float, row)) for row in atoms.get_forces()]
+    return energy, forces
+
 
 # ---------- main ----------
-def parse_kpts(s: str) -> Tuple[int,int,int]:
+def parse_kpts(s: str) -> Tuple[int, int, int]:
     parts = [p.strip() for p in s.split(",")]
     if len(parts) != 3:
         raise ValueError('kpts must look like "2,2,2"')
-    return (int(parts[0]), int(parts[1]), int(parts[2]))
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -292,11 +433,33 @@ def main():
     # xTB params
     ap.add_argument("--charge", type=int, default=0, help="Total charge (xTB)")
     ap.add_argument("--uhf", type=int, default=0, help="Number of unpaired electrons (xTB)")
+    ap.add_argument(
+        "--xtb-gfn",
+        type=int,
+        choices=[0, 1, 2],
+        default=None,
+        help="xTB Hamiltonian level. Default: GFN2 for nonperiodic, GFN1 for periodic",
+    )
+    ap.add_argument(
+        "--xtb-iterations",
+        type=int,
+        default=None,
+        help="Maximum SCC iterations for xTB",
+    )
+    ap.add_argument(
+        "--xtb-etemp",
+        type=float,
+        default=None,
+        help="Electronic temperature (K) for xTB",
+    )
 
     # QE params
     ap.add_argument("--qe-pseudo-dir", default=None, help="Directory containing UPF pseudopotentials")
-    ap.add_argument("--qe-pseudo-map", default=None,
-                    help='JSON dict mapping element->UPF filename, e.g. \'{"C":"C.UPF","H":"H.UPF"}\'')
+    ap.add_argument(
+        "--qe-pseudo-map",
+        default=None,
+        help='JSON dict mapping element->UPF filename, e.g. \'{"C":"C.UPF","H":"H.UPF"}\'',
+    )
     ap.add_argument("--qe-kpts", default="1,1,1", help='k-point mesh like "2,2,2"')
     ap.add_argument("--qe-ecutwfc", type=float, default=50.0, help="Plane-wave cutoff (Ry)")
     ap.add_argument("--qe-ecutrho", type=float, default=400.0, help="Charge density cutoff (Ry)")
@@ -308,16 +471,27 @@ def main():
         raise RuntimeError(f"No structures read from {args.input}")
 
     out_chunks: List[str] = []
+
     for idx, atoms in enumerate(frames):
-        # Ensure we have positions; pbc/cell can be whatever input provides.
         if args.method == "xtb":
-            energy, forces = run_xtb(atoms, charge=args.charge, uhf=args.uhf, optimize=args.optimize)
+            energy, forces = run_xtb(
+                atoms,
+                charge=args.charge,
+                uhf=args.uhf,
+                optimize=args.optimize,
+                gfn=args.xtb_gfn,
+                iterations=args.xtb_iterations,
+                etemp=args.xtb_etemp,
+            )
             out_chunks.append(format_extxyz(atoms, energy, forces, method="xtb"))
+
         else:
             if not args.qe_pseudo_dir or not args.qe_pseudo_map:
                 raise ValueError("--qe-pseudo-dir and --qe-pseudo-map are required for --method qe")
+
             pseudo_map = json.loads(args.qe_pseudo_map)
             kpts = parse_kpts(args.qe_kpts)
+
             energy, forces = run_qe(
                 atoms,
                 pseudo_dir=args.qe_pseudo_dir,
@@ -329,12 +503,13 @@ def main():
             )
             out_chunks.append(format_extxyz(atoms, energy, forces, method="dft-qe"))
 
-        print(f"[{idx+1}/{len(frames)}] done: E={energy:.8f} eV-ish (ASE units depend on backend)")
+        print(f"[{idx + 1}/{len(frames)}] done: E={energy:.8f} eV")
 
     with open(args.output, "w", encoding="utf-8") as f:
         f.write("".join(out_chunks))
 
     print(f"Wrote {len(frames)} frame(s) -> {args.output}")
+
 
 if __name__ == "__main__":
     main()

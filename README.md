@@ -34,7 +34,7 @@ This approach is basically if you have structures in mind, and you just want xtb
 1) **Normalize your raw structure file**
    - If you have mixed formats (plain xyz, partially labeled extxyz, etc.), normalize first:
    ```bash
-   python convert_xyz_dataset.py -i h2o.xyz -o h2o_normalized.extxyz --method xtb
+   python convert_xyz.py -i h2o.xyz -o h2o_normalized.extxyz --method xtb
    ```
 2) **Confirm your data looks something like this(Still no physics computed — just formatting.)**
 ```bash
