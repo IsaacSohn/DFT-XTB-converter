@@ -24,20 +24,20 @@ This repo provides two Python programs:
 ## Pipeline A: Fast xTB Dataset
 
 ### Step 1: Normalize
-```
+
 python convert_xyz.py -i h2o.xyz -o h2o_normalized.extxyz --method xtb
-```
+
 ### Step 2: Run xTB
-```
+
 python run_qm.py -i h2o_normalized.extxyz -o h2o_xtb.extxyz --method xtb
-```
+
 Notes: - Nonperiodic → GFN2-xTB - Periodic → GFN1-xTB (automatic) - If
 convergence issues: --xtb-iterations 1000 --xtb-etemp 1000
 
 ------------------------------------------------------------------------
 
 ## Pipeline B: DFT Labeling (QE)
-```
+
 python run_qm.py -i h2o_normalized.extxyz -o h2o_dft.extxyz\
 --method qe\
 --qe-pseudo-dir ./pseudos\
@@ -45,25 +45,25 @@ python run_qm.py -i h2o_normalized.extxyz -o h2o_dft.extxyz\
 --qe-kpts "1,1,1"\
 --qe-ecutwfc 50\
 --qe-ecutrho 400
-```
+
 ------------------------------------------------------------------------
 
 ## Pipeline C: DFT → xTB (Cheap Relabeling / Distillation)
-```
+
 Use when: - You already have DFT structures - You want fast approximate
 labels - You want large datasets cheaply
-```
+
 ### Step 1: Use existing DFT extxyz
 
 (No conversion needed)
 
 ### Step 2: Run xTB on same structures
-```
+
 python run_qm.py -i dft_dataset.extxyz -o xtb_dataset.extxyz\
 --method xtb\
 --xtb-iterations 1000\
 --xtb-etemp 1000
-```
+
 ### What this does
 
 -   Keeps identical geometry
@@ -83,10 +83,9 @@ python run_qm.py -i dft_dataset.extxyz -o xtb_dataset.extxyz\
 ------------------------------------------------------------------------
 
 # Summary
-```
+
   Pipeline   Speed   Accuracy   Use Case
   ---------- ------- ---------- ------------------------------
   xTB        Fast    Medium     Prototyping / large datasets
   DFT        Slow    High       Ground truth
   DFT→xTB    Fast    Medium     Scaling datasets cheaply
-```
