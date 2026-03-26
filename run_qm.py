@@ -183,182 +183,94 @@ def run_xtb(
     etemp: Optional[float] = None,
 ) -> Tuple[float, List[Tuple[float, float, float]]]:
     """
-    xTB runner that works even when ase.calculators.xtb is missing.
+    Robust xTB runner using xtb-python's ASE calculator.
 
-    Behavior:
-      - nonperiodic systems default to GFN2-xTB
-      - periodic systems default to GFN1-xTB
-      - periodic fallback path writes a Turbomole-style coord file
-      - nonperiodic fallback path writes plain XYZ
-
-    Parameters
-    ----------
-    charge : int
-        Total charge.
-    uhf : int
-        Number of unpaired electrons.
-    optimize : bool
-        Run BFGS optimization if True.
-    gfn : Optional[int]
-        Which GFN level to use. If None:
-          - periodic -> 1
-          - nonperiodic -> 2
-    iterations : Optional[int]
-        Max SCC iterations passed to xTB.
-    etemp : Optional[float]
-        Electronic temperature in K passed to xTB.
+    Strategy:
+    - default to GFN2 for nonperiodic, GFN1 for periodic
+    - try user-requested settings first
+    - if SCC fails, retry with higher electronic temperature / more iterations
+    - raise a clearer error if all retries fail
     """
+    from xtb.ase.calculator import XTB
     from ase.optimize import BFGS
-    import os
-    import subprocess
-    import tempfile
-    import numpy as np
-    from ase.calculators.calculator import Calculator, all_changes
+    from ase.calculators.calculator import CalculationFailed
 
     if gfn is None:
         gfn = 1 if atoms.get_pbc().any() else 2
 
-    # --- Try native ASE xTB calculator first if available ---
-    try:
-        from ase.calculators.xtb import XTB  # type: ignore
+    method_name = f"GFN{gfn}-xTB"
 
-        atoms.calc = XTB(method=f"GFN{gfn}-xTB", charge=charge, uhf=uhf)
-        if optimize:
-            BFGS(atoms, logfile=None).run(fmax=0.05)
+    # First attempt uses user inputs or sane defaults
+    retry_plan = [
+        {
+            "max_iterations": iterations if iterations is not None else 250,
+            "electronic_temperature": etemp if etemp is not None else 300.0,
+        },
+        {
+            "max_iterations": max(iterations or 250, 500),
+            "electronic_temperature": max(etemp or 300.0, 1000.0),
+        },
+        {
+            "max_iterations": max(iterations or 250, 1000),
+            "electronic_temperature": max(etemp or 300.0, 2000.0),
+        },
+    ]
 
-        energy = float(atoms.get_potential_energy())
-        forces = [tuple(map(float, row)) for row in atoms.get_forces()]
-        return energy, forces
+    last_err = None
 
-    except ModuleNotFoundError:
-        pass
+    for attempt_idx, opts in enumerate(retry_plan, start=1):
+        trial_atoms = atoms.copy()
 
-    # --- External xTB wrapper ---
-    class XTBExternal(Calculator):
-        implemented_properties = ["energy", "forces"]
+        try:
+            trial_atoms.calc = XTB(
+                method=method_name,
+                charge=charge,
+                uhf=uhf,
+                max_iterations=opts["max_iterations"],
+                electronic_temperature=opts["electronic_temperature"],
+            )
 
-        def __init__(
-            self,
-            xtb_command: str = "xtb",
-            charge: int = 0,
-            uhf: int = 0,
-            gfn: int = 2,
-            iterations: Optional[int] = None,
-            etemp: Optional[float] = None,
-            **kwargs,
-        ):
-            super().__init__(**kwargs)
-            self.xtb_command = xtb_command
-            self.charge = int(charge)
-            self.uhf = int(uhf)
-            self.gfn = int(gfn)
-            self.iterations = iterations
-            self.etemp = etemp
+            if optimize:
+                BFGS(trial_atoms, logfile=None).run(fmax=0.05)
 
-        def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
-            super().calculate(atoms, properties, system_changes)
+            energy = float(trial_atoms.get_potential_energy())
+            forces = [tuple(map(float, row)) for row in trial_atoms.get_forces()]
 
-            with tempfile.TemporaryDirectory() as d:
-                is_periodic = bool(atoms.get_pbc().any())
+            # Copy optimized positions/cell back if optimization was requested
+            if optimize:
+                atoms.positions[:] = trial_atoms.positions
+                try:
+                    atoms.cell[:] = trial_atoms.cell
+                except Exception:
+                    pass
 
-                if is_periodic:
-                    if cell_to_lattice_string(atoms) is None:
-                        raise ValueError("Periodic input has PBC=True but no valid lattice/cell.")
-                    geom_path = os.path.join(d, "input.coord")
-                    write_xtb_coord(geom_path, atoms)
-                else:
-                    geom_path = os.path.join(d, "input.xyz")
-                    atoms.write(geom_path)
-
-                cmd = [
-                    self.xtb_command,
-                    geom_path,
-                    f"--gfn{self.gfn}",
-                    "--chrg", str(self.charge),
-                    "--uhf", str(self.uhf),
-                    "--grad",
-                ]
-
-                if self.iterations is not None:
-                    cmd.extend(["--iterations", str(self.iterations)])
-
-                if self.etemp is not None:
-                    cmd.extend(["--etemp", str(self.etemp)])
-
-                p = subprocess.run(
-                    cmd,
-                    cwd=d,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+            if attempt_idx > 1:
+                print(
+                    f"[xTB] converged on retry {attempt_idx} "
+                    f"(etemp={opts['electronic_temperature']}, "
+                    f"max_iterations={opts['max_iterations']})"
                 )
-                out = p.stdout
 
-                if p.returncode != 0:
-                    raise RuntimeError(f"xTB failed (code {p.returncode}). Output:\n{out}")
+            return energy, forces
 
-                energy_eh = None
-                for line in out.splitlines():
-                    if "TOTAL ENERGY" in line and "Eh" in line:
-                        toks = line.replace("=", " ").split()
-                        for i, tok in enumerate(toks):
-                            if tok == "Eh" and i > 0:
-                                try:
-                                    energy_eh = float(toks[i - 1])
-                                except ValueError:
-                                    pass
+        except CalculationFailed as e:
+            last_err = e
+            print(
+                f"[xTB] attempt {attempt_idx} failed "
+                f"(etemp={opts['electronic_temperature']}, "
+                f"max_iterations={opts['max_iterations']}): {e}"
+            )
 
-                if energy_eh is None:
-                    raise RuntimeError("Could not parse TOTAL ENERGY from xTB output.")
-
-                grad_path = os.path.join(d, "gradient")
-                if not os.path.exists(grad_path):
-                    raise RuntimeError("xTB did not produce 'gradient' file (expected with --grad).")
-
-                floats = []
-                with open(grad_path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        for tok in line.split():
-                            try:
-                                floats.append(float(tok))
-                            except ValueError:
-                                continue
-
-                n = len(atoms)
-                if len(floats) < 3 * n:
-                    raise RuntimeError("Could not parse enough gradient floats from gradient file.")
-
-                grad = np.array(floats[-3 * n:], dtype=float).reshape((n, 3))
-
-                # Units:
-                # energy in Eh -> eV
-                # gradient in Eh/Bohr -> force in eV/Ang, with minus sign
-                EH_TO_EV = 27.211386245988
-                BOHR_TO_ANG = 0.529177210903
-
-                energy_ev = energy_eh * EH_TO_EV
-                forces_ev_per_ang = -(grad * EH_TO_EV / BOHR_TO_ANG)
-
-                self.results["energy"] = float(energy_ev)
-                self.results["forces"] = forces_ev_per_ang
-
-    atoms.calc = XTBExternal(
-        charge=charge,
-        uhf=uhf,
-        gfn=gfn,
-        iterations=iterations,
-        etemp=etemp,
+    raise RuntimeError(
+        "xTB failed after multiple SCC retry attempts. "
+        "This is usually a convergence problem with the structure, charge/spin, "
+        "or method choice. Try one or more of:\n"
+        "  - --xtb-etemp 1000\n"
+        "  - --xtb-iterations 1000\n"
+        "  - --xtb-gfn 1\n"
+        "  - pre-optimizing the geometry\n"
+        f"Last error: {last_err}"
     )
-
-    if optimize:
-        BFGS(atoms, logfile=None).run(fmax=0.05)
-
-    energy = float(atoms.get_potential_energy())
-    forces = [tuple(map(float, row)) for row in atoms.get_forces()]
-    return energy, forces
-
 
 def run_qe(
     atoms: Atoms,

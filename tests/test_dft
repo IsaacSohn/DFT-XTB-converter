@@ -1,0 +1,25 @@
+import numpy as np
+from ase.io import read
+
+xtb = read("cmon_xtb.extxyz", index=0)
+dft = read("cmon_normalized.extxyz", index=0)
+
+a = xtb.copy()
+b = dft.copy()
+
+if a.get_pbc().any():
+    a.wrap()
+if b.get_pbc().any():
+    b.wrap()
+
+print("xTB pbc:", a.get_pbc())
+print("DFT pbc:", b.get_pbc())
+print("xTB cell:\n", a.cell.array)
+print("DFT cell:\n", b.cell.array)
+
+pos_diff = a.get_positions() - b.get_positions()
+print("Max |pos diff|:", np.abs(pos_diff).max())
+
+print("xTB first force:", a.arrays["force"][0])
+print("DFT first force:", b.arrays["force"][0])
+print("delta first force should be:", b.arrays["force"][0] - a.arrays["force"][0])
