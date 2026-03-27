@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XYZ / EXTXYZ Table Viewer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>XYZ / EXTXYZ Table Viewer</h1>
+    <p>
+      Paste your <code>.xyz</code> or <code>.extxyz</code> text below, or upload a file.
+      The app parses the atom count, metadata line, and each atom row into a searchable table.
+    </p>
+
+    <div class="card controls">
+      <div class="row">
+        <input id="fileInput" type="file" accept=".xyz,.extxyz,.txt" />
+        <button id="parseBtn">Parse Data</button>
+        <button id="loadSampleBtn">Load Sample</button>
+      </div>
+      <textarea id="xyzInput" placeholder="Paste XYZ / EXTXYZ data here..."></textarea>
+      <div id="message" class="small">Ready.</div>
+    </div>
+
+    <div class="card">
+      <div class="meta" id="meta"></div>
+      <input id="searchInput" class="search" type="text" placeholder="Filter table by species or number..." />
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Species</th>
+              <th>X</th>
+              <th>Y</th>
+              <th>Z</th>
+              <th>Fx</th>
+              <th>Fy</th>
+              <th>Fz</th>
+              <th>Atomic #</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
