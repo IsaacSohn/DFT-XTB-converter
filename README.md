@@ -90,3 +90,37 @@ This approach is basically if you have structures in mind, and you just want dft
    H ...
    H ...
    ```
+
+## Pipeline C: DFT → xTB (Cheap Relabeling / Distillation)
+```
+Use when: - You already have DFT structures - You want fast approximate
+labels - You want large datasets cheaply
+```
+### Step 1: Use existing DFT extxyz
+
+(No conversion needed)
+
+### Step 2: Run xTB on same structures
+```
+python run_qm.py -i dft_dataset.extxyz -o xtb_dataset.extxyz
+--method xtb
+--xtb-iterations 1000
+--xtb-etemp 1000
+```
+### What this does
+
+-   Keeps identical geometry
+-   Recomputes energy + forces with xTB
+-   Much faster than DFT
+-   Useful for:
+    -   pretraining
+    -   dataset expansion
+    -   teacher-student setups
+
+### Important Notes
+
+-   Periodic systems automatically use GFN1
+-   Molecular systems use GFN2
+-   xTB != DFT accuracy (approximation)
+
+------------------------------------------------------------------------
