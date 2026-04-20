@@ -1,0 +1,1 @@
+python run_qm.py -i water_dft.xyz -o xtb_dataset.extxyz --method xtb --xtb-iterations 1000 --xtb-etemp 1000

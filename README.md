@@ -1,126 +1,229 @@
 # DFT/xTB Dataset Pipeline (XYZ / extended XYZ)
 
-This repo provides two Python programs:
+This repo provides four Python programs for building quantum chemistry datasets:
 
-1) ```convert_xyz_dataset.py```
-   - Reads **XYZ / extended-XYZ / custom extxyz-like** files
-   - Normalizes them into a consistent **extended XYZ (extxyz)** format
-   - Ensures each atom has: **species, position, force, atomic number (Z)**
-   - Stamps `method="dft"` or `method="xtb"` metadata
+1. `convert_xyz.py` — Normalizes raw XYZ/extxyz files into a consistent extended-XYZ format
+2. `run_qm.py` — Runs xTB or Quantum ESPRESSO (DFT) on structures and writes energies + forces
+3. `delta.py` — Computes delta (correction) energies between xTB and DFT for delta-learning
+4. `comparisons.py` — Evaluates ML model predictions against ground-truth DFT labels
 
-2) ```run_qm.py```
-   - Reads structures (XYZ/extxyz, multi-frame supported)
-   - Runs **xTB** (GFN2-xTB via ASE) or **DFT via Quantum ESPRESSO** (via ASE)
-   - Outputs **extxyz** with **TotEnergy** and **forces** per atom in a consistent schema
+---
 
-## General Pipeline (Recommended)
+## Prerequisites
 
-### An example scenario
-1) We have a database for a molecule called ```h2o.xyz```
-   - this is just info about h2o but really small. like its just 3 lines because in this perfect world, you don't need 12937162837619827368 data points to make an accurate model of anything related to machine learning
-   ```bash
-   3
-   water molecule
-   O  0.000000  0.000000  0.000000
-   H  0.757000  0.586000  0.000000
-   H -0.757000  0.586000  0.000000
-   ```
-2) With this dataset, we would naturally want to use xtb or dft to generate a force field in order for us to feed it to mace.
-3) We have 2 pipelines you can go through in order to achieve this
-
-
-### Pipeline A: Build an xTB dataset fast, then optionally add DFT labels later
-This approach is basically if you have structures in mind, and you just want xtb calculations of them for testing a model(or if you don't have a supercomputer COUGH COUGH)
-1) **Normalize your raw structure file**
-   - If you have mixed formats (plain xyz, partially labeled extxyz, etc.), normalize first:
-   ```bash
-   python convert_xyz.py -i h2o.xyz -o h2o_normalized.extxyz --method xtb
-   ```
-2) **Confirm your data looks something like this(Still no physics computed — just formatting.)**
 ```bash
+pip install ase numpy
+pip install xtb          # required for --method xtb (run_qm.py)
+```
+
+For DFT (`--method qe`), you also need [Quantum ESPRESSO](https://www.quantum-espresso.org/) installed with `pw.x` on your PATH, plus pseudopotential UPF files.
+
+Python 3.8+ is required.
+
+---
+
+## Example scenario
+
+Say you have a plain XYZ file `h2o.xyz` with no energy or force information:
+
+```
+3
+water molecule
+O  0.000000  0.000000  0.000000
+H  0.757000  0.586000  0.000000
+H -0.757000  0.586000  0.000000
+```
+
+The pipelines below walk through how to turn this into a labeled dataset.
+
+---
+
+## Pipeline A: Build an xTB dataset (fast, no supercomputer needed)
+
+### Step 1 — Normalize your raw structure file
+
+```bash
+python convert_xyz.py -i h2o.xyz -o h2o_normalized.extxyz --method xtb
+```
+
+Verify the output looks like this (no physics yet — just formatting):
+
+```
 3
 TotEnergy=nan cutoff=-1.00000000 nneightol=1.20000000 method="xtb" pbc="F F F" Properties=species:S:1:pos:R:3:force:R:3:Z:I:1
-O  0.00000000  0.00000000  0.00000000  0.00000000  0.00000000  0.00000000  8
-H  0.75700000  0.58600000  0.00000000  0.00000000  0.00000000  0.00000000  1
-H -0.75700000  0.58600000  0.00000000  0.00000000  0.00000000  0.00000000  1
+O   0.00000000  0.00000000  0.00000000  0.00000000  0.00000000  0.00000000  8
+H   0.75700000  0.58600000  0.00000000  0.00000000  0.00000000  0.00000000  1
+H  -0.75700000  0.58600000  0.00000000  0.00000000  0.00000000  0.00000000  1
 ```
 
-3) **Run xTB to generate energy + forces**
-   ```bash
-   python run_qm.py -i h2o_normalized.extxyz -o h2o_xtb.extxyz --method xtb
-   ```
+### Step 2 — Run xTB to compute energy + forces
 
-   Output should look something like this
-   ```bash
-   3
-   TotEnergy=-76.42189300 cutoff=-1.00000000 nneightol=1.20000000 method="xtb" pbc="F F F" Properties=species:S:1:pos:R:3:force:R:3:Z:I:1
-   O  0.00000000  0.00000000  0.00000000  -0.01234500  0.00123400  0.00098700  8
-   H  0.75700000  0.58600000  0.00000000   0.00678900 -0.00234500 -0.00043200  1
-   H -0.75700000  0.58600000  0.00000000   0.00555600  0.00111100 -0.00055500  1
-   ```
-
-### Pipeline B: DFT labeling (Quantum ESPRESSO via ASE)
-This approach is basically if you have structures in mind, and you just want dft calculations of them because you have a supercomputer or something
-1) Use the same normalized structure BUT replace xtb with dft
-
-   ```bash
-   3
-   TotEnergy=-76.42189300 cutoff=-1.00000000 nneightol=1.20000000 method="dft" pbc="F F F" Properties=species:S:1:pos:R:3:force:R:3:Z:I:1
-   O  0.00000000  0.00000000  0.00000000  -0.01234500  0.00123400  0.00098700  8
-   H  0.75700000  0.58600000  0.00000000   0.00678900 -0.00234500 -0.00043200  1
-   H -0.75700000  0.58600000  0.00000000   0.00555600  0.00111100 -0.00055500  1
-   ```
-
-
-2) Run QE
-   ```bash
-   python run_qm.py -i h2o_normalized.extxyz -o h2o_dft.extxyz
-      --method qe
-      --qe-pseudo-dir ./pseudos
-      --qe-pseudo-map '{"O":"O.UPF","H":"H.UPF"}'
-      --qe-kpts "1,1,1"
-      --qe-ecutwfc 50
-      --qe-ecutrho 400
-   ```
-   Output would look something like this format
-   ```bash
-   3
-   TotEnergy=-76.43651200 method="dft-qe" pbc="F F F" ...
-   O ...
-   H ...
-   H ...
-   ```
-
-## Pipeline C: DFT → xTB (Cheap Relabeling / Distillation)
+```bash
+python run_qm.py -i h2o_normalized.extxyz -o h2o_xtb.extxyz --method xtb
 ```
-Use when: - You already have DFT structures - You want fast approximate
-labels - You want large datasets cheaply
+
+Output will look like:
+
 ```
-### Step 1: Use existing DFT extxyz
-
-(No conversion needed)
-
-### Step 2: Run xTB on same structures
+3
+TotEnergy=-76.42189300 cutoff=-1.00000000 nneightol=1.20000000 method="xtb" pbc="F F F" Properties=species:S:1:pos:R:3:force:R:3:Z:I:1
+O   0.00000000  0.00000000  0.00000000  -0.01234500  0.00123400  0.00098700  8
+H   0.75700000  0.58600000  0.00000000   0.00678900 -0.00234500 -0.00043200  1
+H  -0.75700000  0.58600000  0.00000000   0.00555600  0.00111100 -0.00055500  1
 ```
-python run_qm.py -i dft_dataset.extxyz -o xtb_dataset.extxyz
---method xtb
---xtb-iterations 1000
---xtb-etemp 1000
+
+**Periodic systems** (e.g., crystals): pass `--default-pbc "T T T"` in Step 1 and `--xtb-iterations 1000 --xtb-etemp 1000` in Step 2. GFN1-xTB is used automatically for periodic structures because GFN2 fails under PBC.
+
+---
+
+## Pipeline B: Build a DFT dataset (Quantum ESPRESSO, needs a supercomputer)
+
+### Step 1 — Normalize with method="dft"
+
+```bash
+python convert_xyz.py -i h2o.xyz -o h2o_normalized.extxyz --method dft
 ```
-### What this does
 
--   Keeps identical geometry
--   Recomputes energy + forces with xTB
--   Much faster than DFT
--   Useful for:
-    -   pretraining
-    -   dataset expansion
-    -   teacher-student setups
+### Step 2 — Run Quantum ESPRESSO
 
-### Important Notes
+```bash
+python run_qm.py \
+  -i h2o_normalized.extxyz \
+  -o h2o_dft.extxyz \
+  --method qe \
+  --qe-pseudo-dir ./pseudos \
+  --qe-pseudo-map '{"O":"O.UPF","H":"H.UPF"}' \
+  --qe-kpts "1,1,1" \
+  --qe-ecutwfc 50 \
+  --qe-ecutrho 400
+```
 
--   Periodic systems automatically use GFN1
--   Molecular systems use GFN2
--   xTB != DFT accuracy (approximation)
+Output format:
 
-------------------------------------------------------------------------
+```
+3
+TotEnergy=-76.43651200 cutoff=-1.00000000 nneightol=1.20000000 method="dft-qe" pbc="F F F" ...
+O  ...
+H  ...
+H  ...
+```
+
+---
+
+## Pipeline C: DFT → xTB distillation (cheap relabeling)
+
+Use when you already have DFT structures and want fast approximate labels for pretraining or dataset expansion.
+
+```bash
+python run_qm.py \
+  -i dft_dataset.extxyz \
+  -o xtb_dataset.extxyz \
+  --method xtb \
+  --xtb-iterations 1000 \
+  --xtb-etemp 1000
+```
+
+This keeps the DFT geometry and recomputes energy + forces with xTB.
+
+---
+
+## Pipeline D: Delta learning dataset
+
+Delta learning trains a model to predict the correction `ΔE = E_dft - E_xtb`. At inference time you run cheap xTB and add the model's correction to get near-DFT accuracy.
+
+### Step 1 — You need both files from the same structures
+
+Run Pipelines A and B (or C) on the same input to get:
+- `h2o_xtb.extxyz` — xTB energies and forces
+- `h2o_dft.extxyz` — DFT energies and forces
+
+### Step 2 — Compute delta energies
+
+```bash
+python delta.py \
+  -x h2o_xtb.extxyz \
+  -d h2o_dft.extxyz \
+  -o h2o_delta.extxyz
+```
+
+Output has `method="delta"` and `TotEnergy = E_dft - E_xtb` (default convention). Both source energies are preserved as `xtb_energy` and `dft_energy` in the header.
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--energy-mode` | `dft-minus-xtb` | Sign convention for ΔE |
+| `--force-mode` | `delta` | `delta`, `zeros`, `keep-dft`, or `keep-xtb` |
+| `--decimals` | `6` | Rounding precision for geometry matching |
+| `--strict-count` | off | Raise error if frame counts differ |
+
+---
+
+## Evaluating ML model predictions
+
+`comparisons.py` compares prediction files against a ground-truth DFT reference. Edit the file paths at the top of the script:
+
+```python
+COMPARE_TO_FILE = Path("comparisons/dft_to_compare_to.xyz")  # ground truth
+PREDICTION_FILES = [
+    Path("comparisons/xtb_predictions.xyz"),
+    Path("comparisons/dft_predictions.xyz"),
+    Path("comparisons/delta_predictions.xyz"),
+]
+```
+
+Then run:
+
+```bash
+python comparisons.py
+```
+
+It trims the ground-truth file to the last 10% of frames to match prediction file size, then reports per-file energy and force errors (MAE, RMSE, MaxAE).
+
+---
+
+## Extended XYZ format reference
+
+Every output file uses this schema per frame:
+
+```
+N
+TotEnergy=<eV> cutoff=<Ry> nneightol=<float> method="<name>" pbc="T/F T/F T/F" [Lattice="<9 floats>"] Properties=species:S:1:pos:R:3:force:R:3:Z:I:1
+<sym>  <x>  <y>  <z>  <fx>  <fy>  <fz>  <Z>
+...
+```
+
+- Positions and forces in Ångström / eV·Å⁻¹
+- `TotEnergy=nan` means the field was missing in the source file (unfilled by computation)
+- `Lattice` is only written for periodic structures (9 floats, row-major)
+
+---
+
+## convert_xyz.py flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `-i` / `--input` | yes | Input XYZ or extxyz file |
+| `-o` / `--output` | yes | Output extxyz file |
+| `--method` | yes | `dft` or `xtb` |
+| `--default-pbc` | no | PBC string, e.g. `"T T T"` (default `"F F F"`) |
+| `--default-cutoff` | no | Cutoff value if missing (default `-1.0`) |
+
+## run_qm.py flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `-i` / `--input` | yes | Input extxyz (multi-frame OK) |
+| `-o` / `--output` | yes | Output extxyz |
+| `--method` | yes | `xtb` or `qe` |
+| `--optimize` | no | Run BFGS geometry optimization |
+| `--charge` | no | Total charge for xTB (default 0) |
+| `--uhf` | no | Unpaired electrons for xTB (default 0) |
+| `--xtb-gfn` | no | GFN level: 0, 1, or 2 (auto-selected if omitted) |
+| `--xtb-iterations` | no | Max SCC iterations |
+| `--xtb-etemp` | no | Electronic temperature in K |
+| `--qe-pseudo-dir` | qe only | Directory containing UPF files |
+| `--qe-pseudo-map` | qe only | JSON mapping element → UPF filename |
+| `--qe-kpts` | no | k-point mesh like `"2,2,2"` (default `"1,1,1"`) |
+| `--qe-ecutwfc` | no | Plane-wave cutoff in Ry (default 50) |
+| `--qe-ecutrho` | no | Charge density cutoff in Ry (default 400) |

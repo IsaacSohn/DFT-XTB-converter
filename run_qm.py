@@ -42,29 +42,6 @@ from ase.io import iread
 from ase import Atoms
 
 
-# ---------- utilities ----------
-Z_MAP: Dict[str, int] = {
-    "H": 1, "He": 2,
-    "C": 6, "N": 7, "O": 8, "F": 9,
-    "P": 15, "S": 16, "Cl": 17, "Br": 35, "I": 53,
-    "Si": 14, "B": 5,
-    "Na": 11, "Mg": 12, "Al": 13,
-    "K": 19, "Ca": 20,
-    "Fe": 26, "Co": 27, "Ni": 28, "Cu": 29, "Zn": 30,
-}
-
-
-def infer_Z(symbol: str) -> int:
-    sym = symbol.strip()
-    if len(sym) >= 2 and sym[1].islower():
-        sym = sym[0].upper() + sym[1].lower()
-    else:
-        sym = sym[0].upper() + (sym[1:].lower() if len(sym) > 1 else "")
-    if sym not in Z_MAP:
-        raise ValueError(f"Unknown element '{symbol}' for Z. Add it to Z_MAP in run_qm.py.")
-    return Z_MAP[sym]
-
-
 def cell_to_lattice_string(atoms: Atoms) -> Optional[str]:
     try:
         cell = atoms.get_cell()
